@@ -1379,9 +1379,68 @@ void mimc_feistel(word* in, word* out, word* round_keys, word* round_constants, 
   uint32 constant_index = 0;
   for(uint32 i = 0; i < num_rounds; i++) {
     // Add constant, add round key
-    bf_add(&(value_branch[branch_order.at(t - 1)]), &(value_branch[branch_order.at(t - 1)]), &(round_constants[constant_index++]));
-    bf_add(&(value_branch[branch_order.at(t - 1)]), &(value_branch[branch_order.at(t - 1)]), &(value_key[0])); // Use always the same value_key[0] for MiMC_Feistel
-    bf_sbox(&value_branch_temp_1, &(value_branch[branch_order.at(t - 1)]));
+    bf_add(&value_branch_temp_1, &(value_branch[branch_order.at(t - 1)]), &(round_constants[constant_index++]));
+    bf_add(&value_branch_temp_1, &value_branch_temp_1, &(value_key[0])); // Use always the same value_key[0] for MiMC_Feistel
+    bf_sbox(&value_branch_temp_1, &value_branch_temp_1);
+    for(uint32 j = 0; j < t - 1; j++) {
+      bf_add(&(value_branch[branch_order.at(j)]), &(value_branch[branch_order.at(j)]), &value_branch_temp_1);
+    }
+
+    // Final rotation
+    std::rotate(branch_order.rbegin(), branch_order.rbegin() + 1, branch_order.rend());
+  }
+
+  // Write to out
+  for(uint32 i = 0; i < t; i++) {
+    out[i] = value_branch[branch_order.at(i)];
+  }
+}
+
+void kn_cipher(word* in, word* out, word* round_keys, word* round_constants, uint32 num_rounds, uint32 n, uint32 t, uchar* data) {
+  
+  // Values to work with
+  word value_branch[t];
+  word value_branch_temp_1 = 0;
+  memset(value_branch, 0, t * sizeof(word));
+  word value_key[t];
+  memcpy(value_key, round_keys, num_rounds * sizeof(word));
+
+  // Assign values (also set MS bits of branches to zero, since in reality this works over GF(2^32) x GF(2^32))
+  std::vector<uint32> branch_order;
+  word mask = ((word)(0x1) << (n-1)) - 1;
+  for(uint32 i = 0; i < t; i++) {
+    //std::cout << "[1]: " << to_string_hex(&(in[i]), sizeof(word)) << std::endl;
+    value_branch[i] = in[i] & mask;
+    //std::cout << "[2]: " << to_string_hex(&(value_branch[i]), sizeof(word)) << std::endl;
+    branch_order.push_back(i);
+  }
+
+  // Cipher implementation
+  word add_1 = 0, add_2 = 0, add_3 = 0, add_4 = 0, add_5 = 0;
+  uint32 constant_index = 0;
+  for(uint32 i = 0; i < num_rounds; i++) {
+    // Expansion (simulate multiplication with a sufficiently random matrix over F_2)
+    value_branch_temp_1 = (value_branch[branch_order.at(t - 1)])
+      ^ ((value_branch[branch_order.at(t - 1)]) << 1)
+      ^ ((value_branch[branch_order.at(t - 1)]) >> 31)
+      ^ ((value_branch[branch_order.at(t - 1)]) << 13)
+      ^ ((value_branch[branch_order.at(t - 1)]) >> 19)
+      ^ ((value_branch[branch_order.at(t - 1)]) << 7)
+      ^ ((value_branch[branch_order.at(t - 1)]) >> 25);
+
+    // Add constant, add round key
+    bf_add(&value_branch_temp_1, &value_branch_temp_1, &(round_constants[constant_index++]));
+    bf_add(&value_branch_temp_1, &value_branch_temp_1, &(value_key[i])); // New round key for each round
+
+    // Cubing
+    bf_sbox(&value_branch_temp_1, &value_branch_temp_1);
+
+    // Truncation (discard MSB)
+    // std::cout << "[1]: " << to_string_hex(&(in[i]), sizeof(word)) << std::endl;
+    value_branch_temp_1 = value_branch_temp_1 & mask;
+    // std::cout << "[2]: " << to_string_hex(&(value_branch[i]), sizeof(word)) << std::endl;
+    // exit(0);
+
     for(uint32 j = 0; j < t - 1; j++) {
       bf_add(&(value_branch[branch_order.at(j)]), &(value_branch[branch_order.at(j)]), &value_branch_temp_1);
     }
@@ -1631,6 +1690,7 @@ int main(int argc, char** argv) {
   uint64 N = n * t;
   uint64 num_rounds = std::stoi(argv[3]);
   uint64 num_bits_active = std::stoi(argv[4]);
+  uint64 n_bytes = ceil((float)(n) / 8.0);
 
   // Set globals
   FIELD_SIZE = n;
@@ -1641,8 +1701,8 @@ int main(int argc, char** argv) {
   }
   uint64 bit_inactive = num_bits_active;
   uint64 begin_at_branch = 0;
-  uint64 cipher_case = 1; // 0 .. MiMC, 1 .. CRF/ERF/MiMC_Feistel, 2 .. Nyb/MRF, 3 .. HadesMiMC, 4.. Shark-like
-  cipher = &gmimc_erf;
+  uint64 cipher_case = 5; // 0 .. MiMC, 1 .. CRF/ERF/MiMC_Feistel, 2 .. Nyb/MRF, 3 .. HadesMiMC, 4.. Shark-like, 5.. KN_Cipher
+  cipher = &kn_cipher;
   bool rand_input = true;
   bool rand_round_keys = true;
   bool rand_constants = true;
@@ -1866,6 +1926,12 @@ int main(int argc, char** argv) {
       std::cout << "Matrix invertible [1]: " << is_matrix_invertible((uchar*)data, t) << std::endl;
     }
   }
+  else if(cipher_case == 5) {
+    num_round_constants = num_rounds;
+    num_round_keys = num_rounds;
+    data = new word[t * t];
+    memset(data, 0x0, sizeof(word) * t * t);
+  }
   else {
     std::cout << "[ERROR] Undefined cipher type " << cipher_case << "." << std::endl;
     exit(1);
@@ -1999,7 +2065,7 @@ int main(int argc, char** argv) {
 
   // Print input sums
   for(uint32 i = 0; i < t; i++) {
-    std::cout << "[I] Branch " << i << ": " << to_string_hex(&(in_sum[i]), sizeof(word) / 2) << std::endl;
+    std::cout << "[I] Branch " << i << ": " << to_string_hex(&(in_sum[i]), n_bytes) << std::endl;
   }
 
   std::cout << "----------" << std::endl;
@@ -2018,12 +2084,12 @@ int main(int argc, char** argv) {
   // Print output sums
   std::cout << "Out (hex):" << std::endl;
   for(uint32 i = 0; i < t; i++) {
-    std::cout << "[O] Branch " << i << ": " << to_string_hex(&(out_sum[i]), sizeof(word) / 2) << std::endl;
+    std::cout << "[O] Branch " << i << ": " << to_string_hex(&(out_sum[i]), n_bytes) << std::endl;
   }
   if(binary_output == true) {
     std::cout << "Out (bin):" << std::endl;
     for(uint32 i = 0; i < t; i++) {
-      std::cout << "[O] Branch " << i << ": " << to_string_binary(&(out_sum[i]), sizeof(word) / 2) << std::endl;
+      std::cout << "[O] Branch " << i << ": " << to_string_binary(&(out_sum[i]), n_bytes) << std::endl;
     }
   }
   //for(uint32 i = 0; i < t; i++) {
