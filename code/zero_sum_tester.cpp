@@ -18,6 +18,9 @@
 #define SBOX_DEGREE 3
 #define SBOX_DEGREE_NUM_SQUARINGS (uint32)(log2(SBOX_DEGREE))
 //#define REDUCE_DEGREE_TWICE // Used for degrees 2^n - 1 (e.g., goes from x^9 to x^7)
+//#define MINIMIZE_NUM_ACTIVE_CELLS // If defined, it will activate bits such that the number of active cells is minimized
+//#define ACTIVE_BITS_UNTIL_ZERO // If defined, the program will search for the number of active bits until a zero sum is reached for the specified instance and round number
+#define LIN_POLY_DEG 3 // 0, 1, 2, 3, 4, 5
 
 typedef unsigned short uint16;
 typedef unsigned int uint32;
@@ -30,6 +33,7 @@ typedef uint128 doubleword;
 // Globals
 void (*bf_add)(word* c, word* a, word* b);
 void (*bf_mul)(word* c, word* a, word* b);
+void (*bf_cube)(word* c, word* a);
 //void (*bf_sbox)(word* c, word* a);
 void (*cipher)(word* in, word* out, word* round_keys, word* round_constants, uint32 num_rounds, uint32 n, uint32 t, uchar* data);
 doubleword IRRED_POLY = 0;
@@ -719,6 +723,52 @@ inline void bf_sbox_test(word* c, word* a) {
   std::cout << "Test 2: " << to_string_hex(c, 4) << std::endl;
 }
 
+// x -> poly_0 * poly_1 * x^(2^LIN_POLY_DEG) + poly_1 * x
+// As poly_0 and poly_1 are independently randomly chosen different from 0,
+// so are poly_0 * poly_1 and poly_1
+inline void bf_linearized_poly_sparse(word* c, word* a, word poly[2]) {
+  word t1 = *a;
+  bf_mul(&t1, &t1, &poly[0]);
+  for (uint32 i = 0; i < LIN_POLY_DEG; i++) {
+    bf_mul(&t1, &t1, &t1);
+  }
+  bf_add(&t1, &t1, a);
+  bf_mul(&t1, &t1, &poly[1]);
+  *c = t1;
+}
+
+// x -> sum_{i <= LIN_POLY_DEG} p_i * x^(2^i)
+// p_i = prod_{j >= i} poly_j^(2^(j-i))
+// As poly_j are independently randomly chosen different from 0,
+// so are prod_{j >= i} poly_j^(2^(j-i))
+inline void bf_linearized_poly_dense(word* c, word* a, word poly[LIN_POLY_DEG + 1]) {
+  word t1 = 0;
+  for (uint32 i = 0; i <= LIN_POLY_DEG; i++) {
+    bf_mul(&t1, &t1, &t1);
+    bf_add(&t1, &t1, a);
+    bf_mul(&t1, &t1, &poly[i]);
+  }
+  *c = t1;
+}
+
+void init_poly_sparse(word poly[2], uint32 n) {
+  uint32 word_unused_bits = (WORDSIZE - (n % WORDSIZE)) % WORDSIZE;
+  uint64 used_mask = 0xFFFFFFFFFFFFFFFF >> word_unused_bits;
+  for (uint32 i = 0; i < 2; i++) {
+    RAND_bytes((uchar*)&poly[i], 8);
+    poly[i] = poly[i] & used_mask;
+  }
+}
+
+void init_poly_dense(word poly[LIN_POLY_DEG + 1], uint32 n) {
+  uint32 word_unused_bits = (WORDSIZE - (n % WORDSIZE)) % WORDSIZE;
+  uint64 used_mask = 0xFFFFFFFFFFFFFFFF >> word_unused_bits;
+  for (uint32 i = 0; i <= LIN_POLY_DEG; i++) {
+    RAND_bytes((uchar*)&poly[i], 8);
+    poly[i] = poly[i] & used_mask;
+  }
+}
+
 void get_cofactor(void* matrix, void* temp, int p, int q, uint32 t, uint32 t_orig) { 
   word (*matrix_ptr)[t_orig] = (word (*)[t_orig]) matrix;
   word (*temp_ptr)[t_orig] = (word (*)[t_orig]) temp;
@@ -1396,6 +1446,62 @@ void mimc_feistel(word* in, word* out, word* round_keys, word* round_constants, 
   }
 }
 
+void mimc_lin_poly_sparse(word* in, word* out, word* round_keys, word* round_constants, uint32 num_rounds, uint32 n, uint32 t, uchar* data) {
+
+  // Values to work with
+  word value_branch = 0;
+  word key = round_keys[0];
+  word* poly_as_ptr = (word*)data;
+
+  // Assign values
+  value_branch = in[0];
+
+  // Set first round constant to zero
+  round_constants[0] = 0;
+
+  // Cipher implementation
+  for(uint32 i = 0; i < num_rounds; i++) {
+    value_branch ^= key;
+    value_branch ^= round_constants[i];
+    bf_sbox(&value_branch, &value_branch);
+    bf_linearized_poly_sparse(&value_branch, &value_branch, poly_as_ptr);
+    //bf_sbox_inverse_3(&value_branch, &value_branch);
+    //std::cout << "Round " << (i + 1) << " finished." << std::endl;
+  }
+  value_branch ^= key;
+
+  // Write to out
+  out[0] = value_branch;
+}
+
+void mimc_lin_poly_dense(word* in, word* out, word* round_keys, word* round_constants, uint32 num_rounds, uint32 n, uint32 t, uchar* data) {
+
+  // Values to work with
+  word value_branch = 0;
+  word key = round_keys[0];
+  word* poly_as_ptr = (word*)data;
+
+  // Assign values
+  value_branch = in[0];
+
+  // Set first round constant to zero
+  round_constants[0] = 0;
+
+  // Cipher implementation
+  for(uint32 i = 0; i < num_rounds; i++) {
+    value_branch ^= key;
+    value_branch ^= round_constants[i];
+    bf_sbox(&value_branch, &value_branch);
+    bf_linearized_poly_dense(&value_branch, &value_branch, poly_as_ptr);
+    //bf_sbox_inverse_3(&value_branch, &value_branch);
+    //std::cout << "Round " << (i + 1) << " finished." << std::endl;
+  }
+  value_branch ^= key;
+
+  // Write to out
+  out[0] = value_branch;
+}
+
 void kn_cipher(word* in, word* out, word* round_keys, word* round_constants, uint32 num_rounds, uint32 n, uint32 t, uchar* data) {
   
   // Values to work with
@@ -1652,7 +1758,7 @@ void shark(word* in, word* out, word* round_keys, word* round_constants, uint32 
       // Constant to key, ARK, Cubing
       bf_add(&(value_key[k % 2]), &(value_key[k % 2]), &(round_constants[constant_index++]));
       bf_add(&(value_branch[i]), &(value_branch[i]), &(value_key[k % 2]));
-      bf_inverse(&(value_branch[i]), &(value_branch[i]));
+      bf_sbox(&(value_branch[i]), &(value_branch[i]));
     }
     // Linear layer
     //std::cout << "[BEFORE] Branch 0: " << to_string_hex(&(value_branch[0]), branch_size) << std::endl;
@@ -1690,7 +1796,13 @@ int main(int argc, char** argv) {
   uint64 N = n * t;
   uint64 num_rounds = std::stoi(argv[3]);
   uint64 num_bits_active = std::stoi(argv[4]);
+  #ifdef ACTIVE_BITS_UNTIL_ZERO
+  num_bits_active = N - 1;
+  #endif
   uint64 n_bytes = ceil((float)(n) / 8.0);
+  uint64 num_branches_split = 3; // Used for splitting active bits
+  RAND_bytes((uchar*)(&num_branches_split), 8);
+  num_branches_split = (num_branches_split % t) + 1;
 
   // Set globals
   FIELD_SIZE = n;
@@ -1701,8 +1813,8 @@ int main(int argc, char** argv) {
   }
   uint64 bit_inactive = num_bits_active;
   uint64 begin_at_branch = 0;
-  uint64 cipher_case = 5; // 0 .. MiMC, 1 .. CRF/ERF/MiMC_Feistel, 2 .. Nyb/MRF, 3 .. HadesMiMC, 4.. Shark-like, 5.. KN_Cipher
-  cipher = &kn_cipher;
+  uint64 cipher_case = 6; // 0 .. MiMC, 1 .. CRF/ERF/MiMC_Feistel, 2 .. Nyb/MRF, 3 .. HadesMiMC, 4.. Shark-like, 5.. KN_Cipher, 6.. Lin poly sparse, 7.. Lin poly dense
+  cipher = &mimc_lin_poly_sparse;
   bool rand_input = true;
   bool rand_round_keys = true;
   bool rand_constants = true;
@@ -1717,109 +1829,109 @@ int main(int argc, char** argv) {
   if(n == 3) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_3_mul;
-    //bf_sbox = &bf_3_cube;
+    bf_cube = &bf_3_cube;
     IRRED_POLY = 0xb;
   }
   else if(n == 5) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_5_mul;
-    //bf_sbox = &bf_5_cube;
+    bf_cube = &bf_5_cube;
     IRRED_POLY = 0x25;
   }
   else if(n == 7) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_7_mul;
-    //bf_sbox = &bf_7_cube;
+    bf_cube = &bf_7_cube;
     IRRED_POLY = 0x83;
   }
   else if(n == 9) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_9_mul;
-    //bf_sbox = &bf_9_cube;
+    bf_cube = &bf_9_cube;
     IRRED_POLY = 0x203;
   }
   else if(n == 11) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_11_mul;
-    //bf_sbox = &bf_11_cube;
+    bf_cube = &bf_11_cube;
     IRRED_POLY = 0x805;
   }
   else if(n == 13) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_13_mul;
-    //bf_sbox = &bf_13_cube;
+    bf_cube = &bf_13_cube;
     IRRED_POLY = 0x201b;
   }
   else if(n == 15) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_15_mul;
-    //bf_sbox = &bf_15_cube;
+    bf_cube = &bf_15_cube;
     IRRED_POLY = 0x8003;
   }
   else if(n == 17) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_17_mul;
-    //bf_sbox = &bf_17_cube;
+    bf_cube = &bf_17_cube;
     IRRED_POLY = 0x20009;
   }
   else if(n == 19) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_19_mul;
-    //bf_sbox = &bf_19_cube;
+    bf_cube = &bf_19_cube;
     IRRED_POLY = 0x80027;
   }
   else if(n == 21) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_21_mul;
-    //bf_sbox = &bf_21_cube;
+    bf_cube = &bf_21_cube;
     IRRED_POLY = 0x200005;
   }
   else if(n == 23) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_23_mul;
-    //bf_sbox = &bf_23_cube;
+    bf_cube = &bf_23_cube;
     IRRED_POLY = 0x800021;
   }
   else if(n == 25) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_25_mul;
-    //bf_sbox = &bf_25_cube;
+    bf_cube = &bf_25_cube;
     IRRED_POLY = 0x2000009;
   }
   else if(n == 27) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_27_mul;
-    //bf_sbox = &bf_27_cube;
+    bf_cube = &bf_27_cube;
     IRRED_POLY = 0x8000027;
   }
   else if(n == 29) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_29_mul;
-    //bf_sbox = &bf_29_cube;
+    bf_cube = &bf_29_cube;
     IRRED_POLY = 0x20000005;
   }
   else if(n == 31) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_31_mul;
-    //bf_sbox = &bf_31_cube;
+    bf_cube = &bf_31_cube;
     IRRED_POLY = 0x80000009;
   }
   else if(n == 32) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_32_mul;
-    //bf_sbox = &bf_32_cube;
+    bf_cube = &bf_32_cube;
     IRRED_POLY = 0x10000008d;
   }
   else if(n == 33) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_33_mul;
-    //bf_sbox = &bf_33_cube;
+    bf_cube = &bf_33_cube;
     IRRED_POLY = 0x20000004b;
   }
   else if(n == 35) {
     bf_add = &bf_add_generic;
     bf_mul = &bf_35_mul;
-    //bf_sbox = &bf_35_cube;
+    bf_cube = &bf_35_cube;
     IRRED_POLY = 0x800000005;
   }
   else {
@@ -1932,6 +2044,25 @@ int main(int argc, char** argv) {
     data = new word[t * t];
     memset(data, 0x0, sizeof(word) * t * t);
   }
+  else if(cipher_case == 6) {
+    num_round_constants = num_rounds;
+    num_round_keys = 1;
+    data = new word[2];
+    memset(data, 0x0, sizeof(word));
+    init_poly_sparse(data, n);
+    std::cout << "Lin poly: 0x" << to_string_hex(&(*(word(*)[LIN_POLY_DEG + 1])data)[0], 8) << ", " << to_string_hex(&(*(word(*)[LIN_POLY_DEG + 1])data)[1], 8) << std::endl;
+  }
+  else if(cipher_case == 7) {
+    num_round_constants = num_rounds;
+    num_round_keys = 1;
+    data = new word[LIN_POLY_DEG + 1];
+    memset(data, 0x0, sizeof(word) * (LIN_POLY_DEG + 1));
+    init_poly_dense(data, n);
+    std::cout << "Lin poly:" << std::endl;
+    for (uint32 i = 0; i <= LIN_POLY_DEG; i++) {
+      std::cout << "0x" << to_string_hex(&(*(word(*)[LIN_POLY_DEG + 1])data)[i], 8) << std::endl;
+    }
+  }
   else {
     std::cout << "[ERROR] Undefined cipher type " << cipher_case << "." << std::endl;
     exit(1);
@@ -1986,10 +2117,13 @@ int main(int argc, char** argv) {
   std::cout << "Number of cells t: " << t << std::endl;
   std::cout << "Number of rounds: " << num_rounds << std::endl;
   std::cout << "Number of active bits: " << num_bits_active << std::endl;
+  std::cout << "Number of active branches: " << num_branches_split << std::endl;
   std::cout << "Inactive bit index in active bits: " << bit_inactive << std::endl;
   std::cout << "Matrix mode: " << matrix_mode << std::endl;
   std::cout << "Number of input texts: " << num_texts << std::endl;
   std::cout << "S-box: x^" << sbox_degree << std::endl;
+  std::cout << "Cipher case: " << cipher_case << std::endl;
+  std::cout << "Lin poly deg: " << LIN_POLY_DEG << std::endl;
 
   //std::set<word> branch_values;
   word test_vector_plaintext[t];
@@ -1997,68 +2131,129 @@ int main(int argc, char** argv) {
   memset(test_vector_plaintext, 0x0, t * sizeof(word));
   memset(test_vector_ciphertext, 0x0, t * sizeof(word));
 
+  #ifdef MINIMIZE_NUM_ACTIVE_CELLS
   uint32 num_affected_branches = ceil((float)num_bits_active / n);
+  #endif
+  #ifndef MINIMIZE_NUM_ACTIVE_CELLS
+  uint32 num_affected_branches = std::min(num_bits_active, num_branches_split);
+  uint32 num_bits_remaining = num_bits_active;
+  uint32 num_bits_used = 0;
+  std::cout << "--- Bit Activation Pattern ---" << std::endl;
+  for(uint32 j = 0; j < num_affected_branches; j++) {
+    uint32 num_active_temp = ceil((float)num_bits_remaining / (num_branches_split-j));
+    num_bits_remaining -= num_active_temp;
+    std::cout << "Branch " << (j + begin_at_branch) << ": " << num_active_temp << " active bits" << std::endl;
+  }
+  #endif
 
   uint64 i_split = 0;
   uint64 shift_amount = std::min(1, (int)(num_bits_active - bit_inactive)); // either 0 or 1
-  for(uint64 i = 0; i < num_texts; i++) {
-    // Set difference
-    for(uint32 j = 0; j < num_affected_branches; j++) {
-      //std::cout << "--- --- --- --- ---" << std::endl;
-      //std::cout << "i: " << to_string_binary(&i, sizeof(word) / 2) << std::endl;
-      i_split = ((i & (((uint64)0x1 << bit_inactive) - 1)) | ((i << shift_amount) & ~(((uint64)0x1 << (bit_inactive + 1)) - 1))) & (used_mask << (j * n));
-      //std::cout << "i_split: " << to_string_binary(&i_split, sizeof(word) / 2) << std::endl;
-      in_copy[j + begin_at_branch] = in[j + begin_at_branch] ^ ((i_split >> (j * n)) & used_mask);
-      //std::cout << "mask: " << std::hex << used_mask << std::dec << std::endl;
-      //std::cout << "(i, j) = (" << i << ", " << j << "): " << to_string_binary(&(in_copy[j + begin_at_branch]), 2) << std::endl;
-    }
 
-    // Input spaces (MDS start = 0 except where noted)
-    //word mults[t - 2]; // t = 2, dummy
-    //word mults[t - 2] = {0xd, 0x1f, 0x7, 0x14, 0x5}; // n = 5, t = 7
-    //word mults[t - 2] = {0x38, 0x79, 0x29}; // 7, 5
-    //word mults[t - 2] = {0x556}; // 11, 3
-    //word mults[t - 2] = {0x155a}; // 13, 3
-    //word mults[t - 2] = {0xc, 0x13, 0xf, 0x5, 0x1, 0x12, 0x19, 0x18, 0x0, 0xd, 0x8}; // 5, 13
-    //word mults[t - 2] = {0x623, 0x784, 0x1aa6}; // 13, 5
-    //word mults[t - 2] = {0x26, 0x5d, 0x30, 0x2e, 0xd, 0x3a, 0x75}; // 7, 9
-    //word mults[t - 2] = {0x65, 0x2d, 0xd, 0x4c}; // 7, 6
-    //word mults[t - 2] = {0x96, 0x110}; // 9, 4, MDS start = 1
-    //word mults[t - 2] = {0x1b2, 0x15f, 0x17e, 0x15d, 0xdc}; // 9, 7
-    //word mults[t - 2] = {0x1e5cd, 0x1f52}; // 17, 4, MDS start = 1
-    //word mults[t - 2] = {0x73, 0x52, 0x11, 0x54, 0x7a, 0x7d, 0x6a, 0x4d, 0x1c, 0x59, 0x64, 0x14, 0x4f, 0x79, 0x2, 0x58, 0x1f}; // 7, 19
-    //word mults[t - 2] = {0x31c96, 0x1af27, 0x32bcd, 0x53a61, 0x299d3}; // 19, 7
-    //word mults[t - 2] = {0x1c6, 0x1ea, 0x87, 0x1e7, 0x52, 0x2c, 0x145, 0x74, 0x12e, 0xb1, 0x143, 0x147, 0xda}; // 9, 15
-    //word mults[t - 2] = {0x6e0f, 0x5edd, 0x18ee, 0x5b57, 0x31a7, 0x3428, 0x6bdb}; // 15, 9
-
-    //pspn_specific_input(in_copy, mults, i, n, t);
-    //pspn_specific_input_17_4(in_copy, i, n, t);
-
-    // Update input sum
-    for(uint32 j = 0; j < t; j++) {
-      in_sum[j] ^= in_copy[j];
-    }
-
-    if(i == 0) {
-      for(uint32 j = 0; j < t; j++) {
-        memcpy(&(test_vector_plaintext[j]), &(in_copy[j]), sizeof(word));
+  uint64 loop_start = 0;
+  uint64 loop_end = 2;
+  while(1)
+  {
+    // Standard loop for number of texts
+    #ifndef ACTIVE_BITS_UNTIL_ZERO
+    for(uint64 i = 0; i < num_texts; i++) {
+    #else
+    for(uint64 i = loop_start; i < loop_end; i++) {
+    #endif
+      #ifdef MINIMIZE_NUM_ACTIVE_CELLS
+      // Set difference (MINIMIZE NUMBER OF ACTIVE CELLS)
+      for(uint32 j = 0; j < num_affected_branches; j++) {
+        //std::cout << "--- --- --- --- ---" << std::endl;
+        //std::cout << "i: " << to_string_binary(&i, sizeof(word) / 2) << std::endl;
+        i_split = ((i & (((uint64)0x1 << bit_inactive) - 1)) | ((i << shift_amount) & ~(((uint64)0x1 << (bit_inactive + 1)) - 1))) & (used_mask << (j * n));
+        //std::cout << "i_split: " << to_string_binary(&i_split, sizeof(word) / 2) << std::endl;
+        in_copy[j + begin_at_branch] = in[j + begin_at_branch] ^ ((i_split >> (j * n)) & used_mask);
+        //std::cout << "mask: " << std::hex << used_mask << std::dec << std::endl;
+        //std::cout << "(i, j) = (" << i << ", " << j << "): " << to_string_binary(&(in_copy[j + begin_at_branch]), 2) << std::endl;
       }
-    }
+      #endif
+      
+      #ifndef MINIMIZE_NUM_ACTIVE_CELLS
+      // Set difference (SPLIT INTO CELLS)
+      num_bits_remaining = num_bits_active;
 
-    cipher(in_copy, out, round_keys, round_constants, num_rounds, n, t, (uchar*)data);
+      #ifdef ACTIVE_BITS_UNTIL_ZERO
+      num_bits_active = (uint32)(log2(loop_end));
+      num_bits_remaining = num_bits_active;
+      #endif
 
-    // Update output sum
-    for(uint32 j = 0; j < t; j++) {
-      out_sum[j] ^= out[j];
-    }
-
-    if(i == 0) {
-      for(uint32 j = 0; j < t; j++) {
-        memcpy(&(test_vector_ciphertext[j]), &(out[j]), sizeof(word));
+      num_bits_used = 0;
+      for(uint32 j = 0; j < num_affected_branches; j++) {
+        uint32 num_active_temp = ceil((float)num_bits_remaining / (num_branches_split-j));
+        num_bits_remaining -= num_active_temp;
+        num_bits_used = num_bits_active - num_bits_remaining;
+        in_copy[j + begin_at_branch] = (i & (((uint64)0x1 << num_bits_used) - 1)) >> (num_bits_used - num_active_temp);
+        //std::cout << "in_copy[" << j << "]: " << to_string_binary(&in_copy[j], sizeof(word) / 2) << std::endl;
       }
+      #endif
+
+      // Input spaces (MDS start = 0 except where noted)
+      //word mults[t - 2]; // t = 2, dummy
+      //word mults[t - 2] = {0xd, 0x1f, 0x7, 0x14, 0x5}; // n = 5, t = 7
+      //word mults[t - 2] = {0x38, 0x79, 0x29}; // 7, 5
+      //word mults[t - 2] = {0x556}; // 11, 3
+      //word mults[t - 2] = {0x155a}; // 13, 3
+      //word mults[t - 2] = {0xc, 0x13, 0xf, 0x5, 0x1, 0x12, 0x19, 0x18, 0x0, 0xd, 0x8}; // 5, 13
+      //word mults[t - 2] = {0x623, 0x784, 0x1aa6}; // 13, 5
+      //word mults[t - 2] = {0x26, 0x5d, 0x30, 0x2e, 0xd, 0x3a, 0x75}; // 7, 9
+      //word mults[t - 2] = {0x65, 0x2d, 0xd, 0x4c}; // 7, 6
+      //word mults[t - 2] = {0x96, 0x110}; // 9, 4, MDS start = 1
+      //word mults[t - 2] = {0x1b2, 0x15f, 0x17e, 0x15d, 0xdc}; // 9, 7
+      //word mults[t - 2] = {0x1e5cd, 0x1f52}; // 17, 4, MDS start = 1
+      //word mults[t - 2] = {0x73, 0x52, 0x11, 0x54, 0x7a, 0x7d, 0x6a, 0x4d, 0x1c, 0x59, 0x64, 0x14, 0x4f, 0x79, 0x2, 0x58, 0x1f}; // 7, 19
+      //word mults[t - 2] = {0x31c96, 0x1af27, 0x32bcd, 0x53a61, 0x299d3}; // 19, 7
+      //word mults[t - 2] = {0x1c6, 0x1ea, 0x87, 0x1e7, 0x52, 0x2c, 0x145, 0x74, 0x12e, 0xb1, 0x143, 0x147, 0xda}; // 9, 15
+      //word mults[t - 2] = {0x6e0f, 0x5edd, 0x18ee, 0x5b57, 0x31a7, 0x3428, 0x6bdb}; // 15, 9
+
+      //pspn_specific_input(in_copy, mults, i, n, t);
+      //pspn_specific_input_17_4(in_copy, i, n, t);
+
+      // Update input sum
+      for(uint32 j = 0; j < t; j++) {
+        in_sum[j] ^= in_copy[j];
+      }
+
+      if(i == 0) {
+        for(uint32 j = 0; j < t; j++) {
+          memcpy(&(test_vector_plaintext[j]), &(in_copy[j]), sizeof(word));
+        }
+      }
+
+      cipher(in_copy, out, round_keys, round_constants, num_rounds, n, t, (uchar*)data);
+
+      // Update output sum
+      for(uint32 j = 0; j < t; j++) {
+        out_sum[j] ^= out[j];
+      }
+
+      if(i == 0) {
+        for(uint32 j = 0; j < t; j++) {
+          memcpy(&(test_vector_ciphertext[j]), &(out[j]), sizeof(word));
+        }
+      }
+
+      //branch_values.insert((out[2] << (2*n)) | (out[1] << n) | out[0]);
     }
 
-    //branch_values.insert((out[2] << (2*n)) | (out[1] << n) | out[0]);
+    #ifndef ACTIVE_BITS_UNTIL_ZERO
+    break;
+    #else
+    bool all_zero = true;
+    for(uint32 j = 0; j < t; j++) {
+      all_zero &= (out_sum[j] == 0);
+    }
+    if(all_zero == true) {
+      break;
+    }
+    else {
+      loop_start = loop_end;
+      loop_end *= 2;
+    }
+    #endif
   }
 
   //std::cout << "Unique output values: " << branch_values.size() << std::endl;
@@ -2095,6 +2290,10 @@ int main(int argc, char** argv) {
   //for(uint32 i = 0; i < t; i++) {
   //  std::cout << std::setfill('0') << std::setw(8) << std::hex << in_sum[i] << std::dec << std::endl;
   //}
+
+  #ifdef ACTIVE_BITS_UNTIL_ZERO
+  std::cout << "Number of active bits needed: " << log2((double)loop_end) << std::endl;
+  #endif
 
   if(data != NULL) {
     delete[] data;
